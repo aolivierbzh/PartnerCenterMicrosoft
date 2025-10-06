@@ -1,0 +1,517 @@
+<#
+    Date        : 25/09/2025
+    By          : Aurélien OLIVIER - SCC FRANCE
+    Version     : 4.3 
+    Nom ps1     : CSP_GDAP_Azure_v4.3.ps1
+
+.SYNOPSIS
+    Ce script PowerShell applique des rôles Azure spécifiques au groupe de sécurité "Foreign Principal"
+    pour l'ensemble des abonnements Azure présents dans un Azure plan. Il supprime également le rôle "Owner"
+    pour ce groupe après l'attribution des rôles moins privilégiés.
+
+.DESCRIPTION
+    Ce script effectue les actions suivantes :
+    1. Configure le chemin du fichier de log et du fichier csv de controle.
+    2. Vérification des droits administrateur et relance.
+    (Option, commenté L105) 3. Détection de la version de PowerShell 7+ et mise à jour si nécessaire via winget. 
+    4. Vérifie et définit la politique d'exécution PowerShell sur RemoteSigned.
+    (Option, commenté L155) 5. Installe et importe le module Az si nécessaire.
+    6. Demande une connexion à Azure via l'authentification de l'appareil.
+    7. Récupère tous les abonnements Azure associés au compte connecté.
+    8. Définit l'ID de l'objet du groupe de sécurité "Foreign Principal".
+    9. Applique les rôles spécifiés (Reader, Billing Reader, Monitoring Reader, Quota Request Operator,
+       Support Request Contributor, Reservation Purchaser) au niveau du groupe de management racine ou par abonnement.
+    10. Applique le rôle "Cost Management Contributor" spécifiquement à chaque abonnement.
+    11. Vérifie si le groupe "Foreign Principal" a le rôle "Owner" sur chaque abonnement ou groupe de management racine,
+        puis supprime ces attributions de rôle.
+    12. Exporte un rapport CSV détaillé incluant les rôles 'Owner' trouvés et supprimés.
+    13. Déconnecte le compte Azure.
+
+.NOTES
+    Prérequis :
+    - Le script doit être exécuté par un utilisateur disposant des droits suffisants (ex: Global Admin ou User Access Administrator)
+      pour attribuer et supprimer des rôles au niveau du groupe de management racine et des abonnements.
+    - La relation d'administration entre le fournisseur CSP et le client final doit être active.
+    - L'ID de l'objet du groupe de sécurité "Foreign Principal" doit être défini dans la variable `$ForeignPrincipalObjectId`.
+    - Nécessite la connectivité Internet.
+    - il recommandé d'utiliser Powershell en version 7.x & + 
+    - winget doit être installé pour la mise à jour automatique de PowerShell.
+    - L'UAC peut demander une confirmation lors de l'exécution.
+#>
+
+
+# --- Configuration des fonctions ---
+
+# Fonction pour écrire dans le log et la console
+function Write-Log {
+    param(
+        [string]$Message,
+        [ConsoleColor]$ForegroundColor = "white",
+        [string]$LogLevel = "INFO" # INFO, WARNING, ERROR
+    )
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $logEntry = "[$timestamp] [$LogLevel] $Message"
+    Add-Content -Path $LogFile -Value $logEntry
+    Write-Host $logEntry -ForegroundColor $ForegroundColor
+}
+
+Clear-Host
+# --- Configuration du Log ---
+Remove-Variable * -ErrorAction SilentlyContinue
+
+# Définition du chemin du répertoire cible pour le script et les logs
+$scriptTargetDirectory = "C:\AzureGDAPLogs\"
+$currentScriptPath = $MyInvocation.MyCommand.Path
+$scriptFileName = Split-Path -Path $currentScriptPath -Leaf
+$targetScriptPath = Join-Path -Path $scriptTargetDirectory -ChildPath $scriptFileName
+# Définition du chemin du fichier de log
+$logFileDirectory = $scriptTargetDirectory
+
+# Définition du chemin du fichier de log
+$NameLogFile = "CSP_GDAP_Azure_v4.2_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+$LogFile = $logFileDirectory + $NameLogFile
+
+# Définition du chemin du fichier CSV pour les résultats de vérification Owner
+$csvFilePath = Join-Path -Path $logFileDirectory -ChildPath "OwnerRoleVerification_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
+
+# Définition de l'emplacement d'exécution du script
+Set-Location -Path $logFileDirectory
+# --- Début de la logique de copie du script ---
+
+# Crée le répertoire cible si il n'existe pas
+If (-not (Test-Path $scriptTargetDirectory)) {
+    New-Item -Path $scriptTargetDirectory -ItemType Directory | Out-Null
+}
+
+# Vérifie si le script est déjà à l'emplacement cible
+if ($currentScriptPath -ne $targetScriptPath) {
+    Write-Log -Message "Le script n'est pas exécuté depuis le répertoire cible ($scriptTargetDirectory)." -ForegroundColor Cyan
+    Write-Log -Message "Copie du script vers '$targetScriptPath' et relancement..." -ForegroundColor Cyan
+
+    try {
+        Copy-Item -Path $currentScriptPath -Destination $scriptTargetDirectory -Force #-ErrorAction Stop
+        # Relance le script depuis le nouvel emplacement avec des privilèges élevés
+        #
+    } catch {
+        Write-Host "Erreur lors de la copie du script : $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+# --- Fin de la logique de copie du script ---
+
+Write-Log -Message "Le répertoire de travail actuel est : $(Get-Location)" -LogLevel "INFO"
+Write-Log -Message "Début du script d'attribution et de vérification des rôles Azure Foreign Principal (Version 4)." -LogLevel "INFO"
+Write-Log -Message "Fichier de log : $LogFile" -LogLevel "INFO"
+Write-Log -Message "Les résultats de la vérification 'Owner' seront exportés vers : $csvFilePath" -LogLevel "INFO"
+Write-Log -Message "Vérification de la version de PowerShell (pwsh.exe)..." -LogLevel "INFO"
+<#
+# Détection de la version de PowerShell 7+
+$pwshPath = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
+$currentPwshVersion = if ($pwshPath) { (Get-Item $pwshPath).VersionInfo.Major } else { 0 } # Définit 0 si pwsh.exe n'est pas trouvé
+
+# Logique de mise à jour/installation
+if ($currentPwshVersion -ge 7) {
+    Write-Log -Message "PowerShell (pwsh.exe) version $currentPwshVersion est déjà 7.0 ou plus. Aucune mise à jour nécessaire." -ForegroundColor Green -LogLevel "INFO"
+} else {
+    Write-Log -Message  "PowerShell (pwsh.exe) version $currentPwshVersion est inférieure à 7.0 ou non trouvée." -ForegroundColor Yellow -LogLevel "WARNING"
+    Write-Log -Message  "Tentative de mise à jour ou d'installation de PowerShell 7 en utilisant winget..." -LogLevel "INFO"
+
+    # Vérification de winget
+    if (Get-Command winget.exe -ErrorAction SilentlyContinue) {
+        Write-Log -Message "winget est détecté. Lancement de l'installation/mise à jour..." -LogLevel "INFO"
+        try {
+            winget install --id Microsoft.PowerShell --source winget --accept-package-agreements
+            if ($LASTEXITCODE -ne 0) { # Condition modifiée pour inclure le message d'erreur winget
+                Write-Log -Message  "La commande winget s'est terminée avec un code de sortie $LASTEXITCODE. L'opération a pu échouer." -ForegroundColor Red -LogLevel "ERROR"
+                Write-Log -Message  "Vérifiez les logs de winget ou exécutez 'winget install --id Microsoft.PowerShell' manuellement." -ForegroundColor Red -LogLevel "ERROR"
+            } else {
+                Write-Log -Message  "Installation/Mise à jour de PowerShell 7 terminée avec succès via winget." -ForegroundColor Green -LogLevel "INFO"
+                Write-Log -Message  "Ouvrez une nouvelle console ou un nouveau terminal pour utiliser la nouvelle version (tapez 'pwsh')." -LogLevel "INFO"
+            }
+        } catch {
+            Write-Log -Message "Une erreur est survenue lors de l'exécution de winget : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+            Write-Log -Message "Essayez d'exécuter 'winget install --id Microsoft.PowerShell' manuellement." -ForegroundColor Red -LogLevel "ERROR"
+        }
+    } else {
+        Write-Log -Message "winget n'est pas détecté sur ce système." -ForegroundColor Red -LogLevel "ERROR"
+        Write-Log -Message "Veuillez installer winget depuis le Microsoft Store ou télécharger le MSI depuis : https://github.com/PowerShell/PowerShell/releases" -ForegroundColor Red -LogLevel "ERROR"
+    }
+}
+#>
+# Vérifier la politique d'exécution
+$executionPolicy = Get-ExecutionPolicy -ErrorAction SilentlyContinue
+if ($executionPolicy -ne 'RemoteSigned') {
+    Write-Log -Message "La politique d'exécution actuelle est '$executionPolicy'. Définition sur 'RemoteSigned'." -ForegroundColor Yellow -LogLevel "WARNING"
+    try {
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force #-ErrorAction Stop
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope 'Process' -Force #-ErrorAction Stop
+        Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope LocalMachine -Force #-ErrorAction Stop
+        Write-Log -Message "La politique d'exécution a été définie sur RemoteSigned." -ForegroundColor Green -LogLevel "INFO"
+    } catch {
+        Write-Log -Message "Erreur lors de la définition de la politique d'exécution : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+        Exit 1
+    }
+} else {
+    Write-Log -Message "La politique d'exécution est déjà définie sur 'RemoteSigned'." -ForegroundColor Green -LogLevel "INFO"
+}
+<#
+# Vérifier si les modules Az sont installés, sinon les installer
+Write-Log -Message "Vérification et installation des modules Az..." -LogLevel "INFO"
+try {
+    if (-not (Get-Module -ListAvailable -Name Az)) {
+        Write-Log -Message "Le module Az n'est pas trouvé. Installation en cours..." -LogLevel "INFO"
+        Install-Module -Name Az -Force -Scope CurrentUser -ErrorAction Stop
+    }
+    else{
+        Write-Log -Message "Mise à jour si nécessaire vers la dernière version du module Az PowerShell..." -LogLevel "INFO"
+        Update-Module -Name Az -Force
+    }
+    Write-Log -Message "Modules Az chargés avec succès." -ForegroundColor Green -LogLevel "INFO"
+} catch {
+    Write-Log -Message "Erreur lors de l'installation ou du chargement des modules Az : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+    Write-Log -Message "Fin du script en raison d'une erreur de module." -ForegroundColor Red -LogLevel "ERROR"
+    exit 1
+}
+
+# Vérification des droits administrateur et relance 
+if (-not ([System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Log -Message "Le script n'est pas exécuté en tant qu'administrateur. Veuillez le relancer avec des privilèges élevés." -ForegroundColor Yellow -LogLevel "WARNING"
+    Start-Process pwsh.exe -Verb RunAs -ArgumentList "-File `"$targetScriptPath`""
+    Exit # Quitte l'instance actuelle si elle n'est pas admin
+}
+#>
+
+# Connexion à Azure avec le MFA
+Write-Log -Message "Tentative de connexion à Azure avec le MFA ..." -LogLevel "INFO"
+Write-Log -Message "Ouvrez un navigateur web et accédez à : https://microsoft.com/devicelogin  " -LogLevel "INFO"
+Write-Log -Message "Copiez le code de session affiché ci-dessous pour vous connecter." -LogLevel "INFO"
+try {
+    Connect-AzAccount -UseDeviceAuthentication -ErrorAction Stop
+    Write-Log -Message "Connexion à Azure réussie." -ForegroundColor Green -LogLevel "INFO"
+} catch {
+    Write-Log -Message "Échec de la connexion à Azure. Veuillez vous assurer que vous êtes connecté ou que vos informations d'identification sont valides. Erreur : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+    Write-Log -Message "Fin du script en raison de l'échec de la connexion." -ForegroundColor Red -LogLevel "ERROR"
+    exit 1
+}
+
+# Demander à l'utilisateur l'ID de l'objet du groupe de sécurité "Foreign Principal"
+# $SCC_CSP_AdminAgents = "84df79be-5eb5-4a05-b9d4-72951df23ee2"
+$ForeignPrincipalObjectId = "84df79be-5eb5-4a05-b9d4-72951df23ee2"
+#$ForeignPrincipalObjectId = Read-Host "Veuillez entrer l'ID de l'objet (Object ID) du groupe de sécurité 'Foreign Principal'"
+if ([string]::IsNullOrWhiteSpace($ForeignPrincipalObjectId)) {
+    Write-Log -Message "L'ID de l'objet du groupe 'Foreign Principal' ne peut pas être vide. Script annulé." -ForegroundColor Red -LogLevel "ERROR"
+    Exit 1
+}
+Write-Log -Message  "ID de l'objet du groupe 'Foreign Principal' : $ForeignPrincipalObjectId" -ForegroundColor Green -LogLevel "INFO"
+
+$foreignPrincipalGroupName = Get-AzADGroup -ObjectId $ForeignPrincipalObjectId.DisplayName
+
+# Liste des rôles à attribuer
+$rolesToAssignGlobal = @(
+    "Reader",
+    "Billing Reader",
+    "Monitoring Reader",
+    "Quota Request Operator",
+    "Support Request Contributor",
+    "Reservation purchaser"
+)
+$roleToAssignPerSubscriptionOnly = "Cost Management Contributor"
+
+# Source des données : https://azure.microsoft.com/en-us/support/legal/offer-details/
+# Ce tableau doit être mis à jour manuellement si de nouvelles offres apparaissent.
+$offermap = @{
+    # Consumption Plans (Pay-As-You-Go)
+    'MS-AZR-0003P' = 'Pay-As-You-Go';
+    'MS-AZR-0023P' = 'Pay-As-You-Go Dev/Test';
+    'MS-AZR-0025P' = 'Azure in CSP';
+    'MS-AZR-0044P' = 'Free Trial';
+    'MS-AZR-0111p' = 'Azure in Open Licensing';
+    'MS-AZR-0143P' = 'Pay-As-You-Go Dev/Test';
+    
+    # Enterprise Agreement (EA) Plans
+    'MS-AZR-0017G' = 'Azure Plan';
+    'MS-AZR-0022P' = 'Enterprise Agreement';
+    'MS-AZR-0024P' = 'Enterprise Agreement';
+    'MS-AZR-0029P' = 'Enterprise Dev/Test';
+    'MS-AZR-0030P' = 'Enterprise Dev/Test';
+    'MS-AZR-0063P' = 'Visual Studio Enterprise (EA) subscribers';
+    
+    # Educational and Other Plans
+    'MS-AZR-0130P' = 'Azure for Students';
+    'MS-AZR-0131P' = 'Azure for Students Starter';
+    'MS-AZR-0144P' = 'Microsoft Imagine';
+    'MS-AZR-0145P' = 'Azure for Students';
+    'MS-AZR-0149P' = 'Azure for Students Starter';
+    'MS-AZR-0243P' = 'Azure Pass Sponsorship';
+    
+    # Visual Studio Subscriber Plans
+    'MS-AZR-0017P' = 'Visual Studio Enterprise subscribers';
+    'MS-AZR-0043P' = 'Visual Studio Ultimate with MSDN';
+    'MS-AZR-0059P' = 'Visual Studio Professional subscribers';
+    'MS-AZR-0060P' = 'Visual Studio Test Professional with MSDN';
+    'MS-AZR-0062P' = 'MSDN Platforms subscribers';
+
+    # Retired Offers
+    'MS-AZR-0001P' = 'Classic MSDN';
+    'MS-AZR-0006P' = 'Azure Free Trial (Classic)';
+    'MS-AZR-0007P' = 'DreamSpark';
+}
+
+# Récupérer tous les abonnements
+Write-Log -Message "Récupération de tous les abonnements Azure..." -LogLevel "INFO"
+$subscriptions = Get-AzSubscription -ErrorAction SilentlyContinue
+if (-not $subscriptions) {
+    Write-Log -Message "Aucun abonnement Azure trouvé. Veuillez vérifier votre connexion ou les permissions." -ForegroundColor Yellow -LogLevel "WARNING"
+    Write-Log -Message "Fin du script." -LogLevel "INFO"
+    exit 0
+} else {
+    Write-Log -Message "Nombre d'abonnements trouvés : $($subscriptions.Count)" -LogLevel "INFO"
+    Write-Log -Message "Liste des abonnements et de leur plan/offre :" -LogLevel "INFO"
+
+    # Boucle pour afficher les détails de chaque abonnement
+    foreach ($sub in $subscriptions) {
+        # Get the offer type using Get-AzSubscription
+        $offerType = (Get-AzSubscription -SubscriptionId $sub.SubscriptionId).OfferType
+        
+        # Get the commercial name from the map
+        $commercialName = $offermap[$offerType]
+        
+        # Check if a commercial name was found
+        if ($null -eq $commercialName) {
+            Write-Log -Message "Attention: Nom commercial inconnu pour l'offre: $offerType." -LogLevel "WARNING" -ForegroundColor Yellow
+            $commercialName = "Unknown"
+        }
+
+        # Afficher les informations complètes pour chaque abonnement
+        $message = "Nom de l'abonnement: $($sub.Name), Plan/Offre: $offerType, Nom commercial: $commercialName"
+        Write-Log -Message $message -ForegroundColor Green -LogLevel "INFO"
+    }   
+}
+
+# Tenter de récupérer le groupe de management racine
+Write-Log -Message "Tentative de récupération du groupe de management racine..." -LogLevel "INFO"
+$rootManagementGroup = $null
+try {
+    $rootManagementGroup = Get-AzManagementGroup -GroupName "root" -ErrorAction SilentlyContinue
+    if ($rootManagementGroup) {
+        Write-Log -Message "Groupe de management racine trouvé : $($rootManagementGroup.DisplayName) (ID: $($rootManagementGroup.Id))" -LogLevel "INFO"
+    } else {
+        Write-Log -Message "Le groupe de management racine n'a pas été trouvé. Les rôles globaux seront appliqués à chaque abonnement individuellement." -ForegroundColor Yellow -LogLevel "WARNING"
+    }
+} catch {
+    Write-Log -Message "Erreur lors de la récupération du groupe de management racine : $($_.Exception.Message). Les rôles globaux seront appliqués à chaque abonnement." -ForegroundColor Yellow -LogLevel "WARNING"
+}
+
+# Rôles globaux (appliqués au Management Group ou à chaque abonnement si MG non trouvé)
+if ($rootManagementGroup) {
+    Write-Log -Message "Application des rôles globaux au groupe de management racine : $($rootManagementGroup.DisplayName)." -LogLevel "INFO"
+    foreach ($role in $rolesToAssignGlobal) {
+        Write-Log -Message "Attribution du rôle '$role' à '$foreignPrincipalGroupName' sur le groupe de management racine..." -LogLevel "INFO"
+        try {
+            $existingAssignment = Get-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $role -Scope $rootManagementGroup.Id -ErrorAction SilentlyContinue
+            if ($existingAssignment) {
+                Write-Log -Message "L'attribution du rôle '$role' existe déjà pour '$foreignPrincipalGroupName' sur le groupe de management racine. Ignoré." -LogLevel "INFO"
+            } else {
+                New-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $role -Scope $rootManagementGroup.Id -ErrorAction Stop
+                Write-Log -Message "Rôle '$role' attribué avec succès à '$foreignPrincipalGroupName' sur le groupe de management racine." -ForegroundColor Green -LogLevel "INFO"
+            }
+        } catch {
+            Write-Log -Message "Erreur lors de l'attribution du rôle '$role' sur le groupe de management racine : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+        }
+    }
+} else {
+    Write-Log -Message "Le groupe de management racine n'est pas disponible. Application des rôles globaux à chaque abonnement individuellement." -ForegroundColor Yellow -LogLevel "WARNING"
+    foreach ($sub in $subscriptions) {
+        Write-Log -Message "Traitement de l'abonnement : $($sub.Name) (ID: $($sub.Id)) pour les rôles globaux." -LogLevel "INFO"
+        try {
+            Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+            foreach ($role in $rolesToAssignGlobal) {
+                Write-Log -Message "Attribution du rôle '$role' à '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name)..." -LogLevel "INFO"
+                try {
+                    $existingAssignment = Get-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $role -Scope "/subscriptions/$($sub.Id)" -ErrorAction SilentlyContinue
+                    if ($existingAssignment) {
+                        Write-Log -Message "L'attribution du rôle '$role' existe déjà pour '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name). Ignoré." -LogLevel "INFO"
+                    } else {
+                        New-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $role -Scope "/subscriptions/$($sub.Id)" -ErrorAction Stop
+                        Write-Log -Message "Rôle '$role' attribué avec succès à '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name)." -ForegroundColor Green -LogLevel "INFO"
+                    }
+                } catch {
+                    Write-Log -Message "Erreur lors de l'attribution du rôle '$role' sur l'abonnement $($sub.Name) : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+                }
+            }
+        } catch {
+            Write-Log -Message "Erreur lors de la définition du contexte ou du traitement de l'abonnement $($sub.Name) pour les rôles globaux : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+        }
+    }
+}
+
+# Rôle "Cost Management Contributor" (toujours appliqué spécifiquement à chaque abonnement)
+Write-Log -Message "Application du rôle '$roleToAssignPerSubscriptionOnly' à chaque abonnement." -LogLevel "INFO"
+foreach ($sub in $subscriptions) {
+    Write-Log -Message "Traitement de l'abonnement : $($sub.Name) (ID: $($sub.Id)) pour le rôle '$roleToAssignPerSubscriptionOnly'." -LogLevel "INFO"
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+        Write-Log -Message "Attribution du rôle '$roleToAssignPerSubscriptionOnly' à '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name)..." -LogLevel "INFO"
+        try {
+            $existingAssignment = Get-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $roleToAssignPerSubscriptionOnly -Scope "/subscriptions/$($sub.Id)" -ErrorAction SilentlyContinue
+            if ($existingAssignment) {
+                Write-Log -Message "L'attribution du rôle '$roleToAssignPerSubscriptionOnly' existe déjà pour '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name). Ignoré." -LogLevel "INFO"
+            } else {
+                New-AzRoleAssignment -ObjectId $foreignPrincipalObjectId -RoleDefinitionName $roleToAssignPerSubscriptionOnly -Scope "/subscriptions/$($sub.Id)" -ErrorAction Stop
+                Write-Log -Message "Rôle '$roleToAssignPerSubscriptionOnly' attribué avec succès à '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name)." -ForegroundColor Green -LogLevel "INFO"
+            }
+        } catch {
+            Write-Log -Message "Erreur lors de l'attribution du rôle '$roleToAssignPerSubscriptionOnly' sur l'abonnement $($sub.Name) : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+        }
+    } catch {
+        Write-Log -Message "Erreur lors de la définition du contexte ou du traitement de l'abonnement $($sub.Name) pour le rôle '$roleToAssignPerSubscriptionOnly' : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+    }
+}
+Write-Log -Message "Fin de l'attribution des rôles pour tous les abonnements." -LogLevel "INFO"
+
+# --- Démarrage de la suppression du rôle 'Owner' pour le Groupe 'Foreign Principal' ---
+Write-Log -Message "--- Démarrage de la suppression du rôle 'Owner' pour '$foreignPrincipalGroupName' ---" -LogLevel "INFO"
+
+$removedOwnerAssignments = @() # Pour stocker les attributions d'Owner supprimées
+$ownerSubscriptions = @() # Cette variable n'était pas remplie dans les parties fournies, mais est utilisée plus loin. Initialisation ici.
+
+# --- Traitement du Groupe de Management Racine (si applicable) ---
+if ($rootManagementGroup) {
+    Write-Log -Message "Vérification du rôle 'Owner' sur le groupe de management racine : $($rootManagementGroup.DisplayName)." -LogLevel "INFO"
+    try {
+        $ownerAssignmentsOnRoot = Get-AzRoleAssignment -ObjectId $ForeignPrincipalObjectId -RoleDefinitionName "Owner" -Scope $rootManagementGroup.Id -ErrorAction SilentlyContinue
+        if ($ownerAssignmentsOnRoot) {
+            Write-Log -Message "Le rôle 'Owner' a été trouvé sur le groupe de management racine. Tentative de suppression..." -ForegroundColor Yellow -LogLevel "WARNING"
+            foreach ($assignment in $ownerAssignmentsOnRoot) {
+                Remove-AzRoleAssignment -ObjectId $ForeignPrincipalObjectId -RoleDefinitionName "Owner" -Scope $rootManagementGroup.Id -ErrorAction Stop -Force
+                Write-Log -Message "Rôle 'Owner' supprimé avec succès pour '$foreignPrincipalGroupName' sur le groupe de management racine." -ForegroundColor Green -LogLevel "INFO"
+                $removedOwnerAssignments += $assignment # Ajoute l'attribution supprimée à la liste
+            }
+        } else {
+            Write-Log -Message "Le rôle 'Owner' n'est pas attribué à '$foreignPrincipalGroupName' sur le groupe de management racine. Aucune action requise." -LogLevel "INFO"
+        }
+    } catch {
+        Write-Log -Message "Erreur lors de la vérification/suppression du rôle 'Owner' sur le groupe de management racine : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+    }
+}
+
+# --- Traitement de chaque abonnement ---
+Write-Log -Message "Vérification et suppression du rôle 'Owner' sur chaque abonnement..." -LogLevel "INFO"
+foreach ($sub in $subscriptions) {
+    Write-Log -Message "Traitement de l'abonnement : $($sub.Name) (ID: $($sub.Id))" -LogLevel "INFO"
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop
+        $ownerAssignmentsOnSub = Get-AzRoleAssignment -ObjectId $ForeignPrincipalObjectId -RoleDefinitionName "Owner" -Scope "/subscriptions/$($sub.Id)" -ErrorAction SilentlyContinue
+
+        if ($ownerAssignmentsOnSub) {
+            # Capture l'abonnement où Owner a été trouvé (avant suppression)
+            # Cette logique doit être ici pour que $ownerSubscriptions soit correctement remplie
+            if (-not ($ownerSubscriptions | Where-Object {$_.Id -eq $sub.Id})) {
+                $ownerSubscriptions += $sub
+            }
+
+            Write-Log -Message "Le rôle 'Owner' a été trouvé pour '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name). Tentative de suppression..." -ForegroundColor Yellow -LogLevel "WARNING"
+            foreach ($assignment in $ownerAssignmentsOnSub) {
+                Remove-AzRoleAssignment -ObjectId $ForeignPrincipalObjectId -RoleDefinitionName "Owner" -Scope "/subscriptions/$($sub.Id)" -ErrorAction Stop -Force
+                Write-Log -Message "Rôle 'Owner' supprimé avec succès pour '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name)." -ForegroundColor Green -LogLevel "INFO"
+                $removedOwnerAssignments += $assignment # Ajoute l'attribution supprimée à la liste
+            }
+        } else {
+            Write-Log -Message "Le rôle 'Owner' n'est pas attribué à '$foreignPrincipalGroupName' sur l'abonnement $($sub.Name). Aucune action requise." -LogLevel "INFO"
+        }
+    } catch {
+        Write-Log -Message "Erreur lors de la vérification/suppression du rôle 'Owner' sur l'abonnement $($sub.Name) : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+    }
+}
+
+Write-Log -Message "--- Fin de la suppression du rôle 'Owner' ---" -LogLevel "INFO"
+
+# Collecte de toutes les données pour l'export CSV
+$exportData = @()
+
+# Ajout des abonnements où le rôle 'Owner' était présent (avant suppression si applicable)
+if ($ownerSubscriptions.Count -gt 0) {
+    Write-Log -Message "Le groupe 'Foreign Principal' disposait du rôle 'Owner' sur les abonnements suivants :" -LogLevel "INFO"
+    $ownerSubscriptions | Format-Table -AutoSize | Out-String | ForEach-Object { Write-Log -Message $_ -LogLevel "INFO" }
+
+    foreach ($sub in $ownerSubscriptions) {
+        $exportData += [PSCustomObject]@{
+            Type              = "Owner_Found_Before_Removal"
+            SubscriptionName  = $sub.Name
+            SubscriptionId    = $sub.Id
+            RoleDefinition    = "Owner"
+            ObjectId          = $ForeignPrincipalObjectId
+            Scope             = "/subscriptions/$($sub.Id)"
+            Status            = "Found"
+            Action            = "N/A (Details logged)"
+            Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+} else {
+    Write-Log -Message "Le groupe 'Foreign Principal' NE disposait PAS du rôle 'Owner' sur aucun des abonnements vérifiés." -LogLevel "INFO"
+    $exportData += [PSCustomObject]@{
+        Type              = "Owner_Found_Before_Removal"
+        SubscriptionName  = "N/A"
+        SubscriptionId    = "N/A"
+        RoleDefinition    = "Owner"
+        ObjectId          = $ForeignPrincipalObjectId
+        Scope             = "N/A"
+        Status            = "Not Found"
+        Action            = "N/A"
+        Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+}
+
+# Ajout des attributions 'Owner' qui ont été supprimées
+if ($removedOwnerAssignments.Count -gt 0) {
+    Write-Log -Message "Récapitulatif des attributions 'Owner' supprimées pour '$foreignPrincipalGroupName' :" -LogLevel "INFO"
+    $removedOwnerAssignments | Select-Object DisplayName, RoleDefinitionName, Scope, @{N='ScopeName';E={($_.Scope -split '/')[-1]}} | Format-Table -AutoSize | Out-String | ForEach-Object { Write-Log -Message $_ -LogLevel "INFO" }
+
+    foreach ($assignment in $removedOwnerAssignments) {
+        $exportData += [PSCustomObject]@{
+            Type              = "Owner_Role_Removed"
+            SubscriptionName  = ($subscriptions | Where-Object {$_.Id -eq ($assignment.Scope -split '/')[-1]})?.Name # Tente de trouver le nom de l'abonnement
+            SubscriptionId    = ($assignment.Scope -split '/')[-1] # Extrait l'ID de l'abonnement du scope
+            RoleDefinition    = $assignment.RoleDefinitionName
+            ObjectId          = $assignment.ObjectId
+            Scope             = $assignment.Scope
+            Status            = "Removed"
+            Action            = "Role Removed"
+            Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        }
+    }
+} else {
+    Write-Log -Message "Aucune attribution du rôle 'Owner' n'a été trouvée ou supprimée pour '$foreignPrincipalGroupName'." -LogLevel "INFO"
+    $exportData += [PSCustomObject]@{
+        Type              = "Owner_Role_Removed"
+        SubscriptionName  = "N/A"
+        SubscriptionId    = "N/A"
+        RoleDefinition    = "Owner"
+        ObjectId          = $ForeignPrincipalObjectId
+        Scope             = "N/A"
+        Status            = "Not Found/Removed"
+        Action            = "No Action"
+        Timestamp         = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    }
+}
+
+# Exportation de toutes les données collectées vers CSV
+Write-Log -Message "Exportation de tous les détails du rôle 'Owner' vers le fichier CSV : $csvFilePath" -LogLevel "INFO"
+try {
+    $exportData | Export-Csv -Path $csvFilePath -NoTypeInformation -Encoding UTF8 -Force
+    Write-Log -Message "Exportation CSV réussie." -ForegroundColor Green -LogLevel "INFO"
+} catch {
+    Write-Log -Message "Erreur lors de l'exportation CSV : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+}
+
+Write-Log -Message "Fin du script d'attribution et de vérification des rôles Azure." -LogLevel "INFO"
+
+# Déconnexion d'Azure
+Write-Log -Message "Déconnexion d'Azure..." -LogLevel "INFO"
+try {
+    Disconnect-AzAccount -ErrorAction SilentlyContinue
+    Write-Log -Message "Déconnexion d'Azure réussie." -LogLevel "INFO"
+} catch {
+    Write-Log -Message "Erreur lors de la déconnexion d'Azure : $($_.Exception.Message)" -ForegroundColor Red -LogLevel "ERROR"
+}
+
+Write-Log -Message "Script terminé." -LogLevel "INFO"
